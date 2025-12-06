@@ -2,16 +2,13 @@
    Yjs provider wrapper with read + write helpers for Excalidraw elements.
    - init(roomId, wsUrl, opts)
    - writeElements(elements)
+   - writePoints(elementId, pointsBatch)
    - deleteElement(id)
    - onElementsChanged(cb)
    - onAwareness(cb)
    - getStatus()
    - destroy()
-   
-   Requires: yjs, y-websocket, y-indexeddb
-   npm install yjs y-websocket y-indexeddb
 */
-
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { IndexeddbPersistence } from "y-indexeddb";
@@ -40,6 +37,22 @@ export default class YjsProvider {
     this.doc = new Y.Doc();
     this.elementsMap = this.doc.getMap("elements");
     this.orderArray = this.doc.getArray("order");
+
+    // Debug: log binary updates produced by this local Y.Doc.
+    this.doc.on("update", (update: Uint8Array, origin: any) => {
+      try {
+        // lightweight logging: bytes + origin
+        // eslint-disable-next-line no-console
+        console.debug("[yjsprovider] doc.update", {
+          bytes: update?.byteLength ?? 0,
+          origin: origin ?? null,
+          roomId: this.roomId,
+          ts: Date.now(),
+        });
+      } catch (e) {
+        // swallow logging errors
+      }
+    });
   }
 
   async init(roomId: string, wsUrl: string, opts: YjsProviderOpts = {}) {
@@ -49,20 +62,32 @@ export default class YjsProvider {
       try {
         this.indexeddb = new IndexeddbPersistence(`excalidraw-${roomId}`, this.doc);
         await this.indexeddb.whenSynced;
+        // eslint-disable-next-line no-console
+        console.info("[yjsprovider] indexeddb persistence synced", { roomId });
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.warn("IndexeddbPersistence init failed", e);
       }
     }
 
-    // WebsocketProvider expects a "url" and a room name
-    // wsUrl should be something like ws://host:1234
     this.provider = new WebsocketProvider(wsUrl, roomId, this.doc, { connect: true });
 
-    // Observe changes
+    try {
+      (this.provider as any).on("status", (event: any) => {
+        // eslint-disable-next-line no-console
+        console.info("[yjsprovider] websocket status", {
+          status: event.status ?? event,
+          roomId,
+          ts: Date.now(),
+        });
+      });
+    } catch (_) {
+      // ignore if provider version doesn't support this hook
+    }
+
     this.elementsMap.observe(this._onYChange);
     this.orderArray.observe(this._onYChange);
 
-    // Awareness
     if ((this.provider as any).awareness) {
       (this.provider as any).awareness.on("change", this._onAwarenessChange);
     }
@@ -84,15 +109,29 @@ export default class YjsProvider {
       } catch (e) {}
       this.provider = null;
     }
-    // Do not call this.doc.destroy() in case other code still references it.
     this.roomId = null;
   }
 
-  // Convert Y.Map -> ExcalidrawElement
+  // Convert Y.Map/Y.Array/Y.Text -> ExcalidrawElement
   private yMapToElement(id: string, ymap: Y.Map<any>): ExcalidrawElement {
     const el: any = { id };
     ymap.forEach((v: any, k: string) => {
-      el[k] = v;
+      // if this value is a Y.Array, convert to a JS array
+      if (v instanceof Y.Array) {
+        try {
+          el[k] = v.toArray();
+        } catch (_) {
+          el[k] = [];
+        }
+      } else if (v instanceof Y.Text) {
+        try {
+          el[k] = v.toString();
+        } catch (_) {
+          el[k] = "";
+        }
+      } else {
+        el[k] = v;
+      }
     });
     return el as ExcalidrawElement;
   }
@@ -115,41 +154,119 @@ export default class YjsProvider {
   }
 
   // Write many elements in a transaction. Each element becomes a Y.Map stored at elementsMap[id].
+  // This will update non-point fields and ensure points are represented as Y.Array (replace)
   writeElements(elements: ExcalidrawElement[]) {
+    // Debug: log call
+    // eslint-disable-next-line no-console
+    console.info("[yjsprovider] writeElements called", {
+      count: elements?.length ?? 0,
+      roomId: this.roomId,
+      ts: Date.now(),
+    });
+
+    const origin = "collab-write";
     this.doc.transact(() => {
       for (const element of elements) {
-        this.setElementYMap(element);
+        this.setElementYMap(element, { replacePoints: true });
       }
-    }, this);
+    }, origin);
+  }
+
+  // Append incremental points for a given element (efficient small ops).
+  writePoints(elementId: string, pointsBatch: any[]) {
+    if (!pointsBatch || pointsBatch.length === 0) return;
+    // eslint-disable-next-line no-console
+    console.debug("[yjsprovider] writePoints", {
+      id: elementId,
+      batchLen: pointsBatch.length,
+      roomId: this.roomId,
+      ts: Date.now(),
+    });
+
+    this.doc.transact(() => {
+      let ym = this.elementsMap.get(elementId) as Y.Map<any> | undefined;
+      if (!ym) {
+        ym = new Y.Map();
+        this.elementsMap.set(elementId, ym);
+        // ensure order
+        if (!this.orderArray.toArray().includes(elementId)) {
+          this.orderArray.push([elementId]);
+        }
+      }
+      let ypoints = ym.get("points") as Y.Array<any> | undefined;
+      if (!ypoints) {
+        ypoints = new Y.Array();
+        ym.set("points", ypoints);
+      }
+      // push batch
+      ypoints.push(pointsBatch);
+    }, "points-append");
   }
 
   // Delete an element (remove from map and order array)
   deleteElement(id: string) {
     this.doc.transact(() => {
       this.elementsMap.delete(id);
-      // remove from order array if present
       const arr = this.orderArray.toArray();
       const idx = arr.indexOf(id);
       if (idx !== -1) {
         this.orderArray.delete(idx, 1);
       }
-    }, this);
+    }, "collab-delete");
   }
 
   // Helper: set element fields inside a Y.Map so concurrent field updates merge
-  private setElementYMap(element: ExcalidrawElement) {
+  // If replacePoints=true and element.points is an array, replace the Y.Array contents.
+  private setElementYMap(element: ExcalidrawElement, opts?: { replacePoints?: boolean }) {
     let ym = this.elementsMap.get(element.id) as Y.Map<any> | undefined;
     if (!ym) {
       ym = new Y.Map();
       this.elementsMap.set(element.id, ym);
-      // ensure order
       if (!this.orderArray.toArray().includes(element.id)) {
         this.orderArray.push([element.id]);
       }
     }
-    // set/update fields
+    // set/update fields; treat 'points' and 'text' specially
     Object.entries(element).forEach(([k, v]) => {
-      ym!.set(k, v as any);
+      if (k === "points") {
+        // if caller wants to replace points, swap into a Y.Array (clear/push)
+        if (opts?.replacePoints) {
+          // ensure Y.Array exists and replace contents
+          let ypoints = ym!.get("points") as Y.Array<any> | undefined;
+          if (!ypoints) {
+            ypoints = new Y.Array();
+            ym!.set("points", ypoints);
+          } else {
+            // clear existing
+            ypoints.delete(0, ypoints.length);
+          }
+          if (Array.isArray(v) && v.length > 0) {
+            ypoints.push(v);
+          }
+        } else {
+          // if replacePoints not requested, just ignore setting full points here
+          // (incremental appends should use writePoints)
+        }
+      } else if (k === "text") {
+        // use Y.Text for collaborative text (if present as string)
+        let ytext = ym!.get("text") as Y.Text | undefined;
+        if (!ytext) {
+          ytext = new Y.Text();
+          ym!.set("text", ytext);
+          if (typeof v === "string" && v.length > 0) {
+            ytext.insert(0, v);
+          }
+        } else {
+          // replace content with the string value for final commits
+          if (typeof v === "string") {
+            ytext.delete(0, ytext.length);
+            if (v.length > 0) ytext.insert(0, v);
+          }
+        }
+      } else {
+        // normal field set
+        ym!.set(k, v as any);
+      }
     });
   }
 
@@ -168,6 +285,7 @@ export default class YjsProvider {
         const elements = this.readAllElements();
         this.onElementsCb(elements);
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.error("YjsProvider _onYChange error", e);
       }
     }
@@ -187,5 +305,14 @@ export default class YjsProvider {
       provider: this.provider,
       doc: this.doc,
     };
+  }
+
+  // Helpful runtime helper for debug: returns an id identifying this client
+  getClientID(): number | null {
+    try {
+      return (this.provider as any)?.awareness?.clientID ?? (this.doc as any).clientID ?? null;
+    } catch (_) {
+      return null;
+    }
   }
 }

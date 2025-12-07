@@ -41,7 +41,6 @@ export default class YjsProvider {
     // Debug: log binary updates produced by this local Y.Doc.
     this.doc.on("update", (update: Uint8Array, origin: any) => {
       try {
-        // lightweight logging: bytes + origin
         // eslint-disable-next-line no-console
         console.debug("[yjsprovider] doc.update", {
           bytes: update?.byteLength ?? 0,
@@ -112,6 +111,12 @@ export default class YjsProvider {
     this.roomId = null;
   }
 
+  // 🔹 NEW: helper to recognize stroke-like elements
+  private isStrokeElement(el: ExcalidrawElement): boolean {
+    const t = (el as any).type;
+    return t === "freedraw" || t === "line" || t === "arrow";
+  }
+
   // Convert Y.Map/Y.Array/Y.Text -> ExcalidrawElement
   private yMapToElement(id: string, ymap: Y.Map<any>): ExcalidrawElement {
     const el: any = { id };
@@ -167,6 +172,15 @@ export default class YjsProvider {
     const origin = "collab-write";
     this.doc.transact(() => {
       for (const element of elements) {
+        // 🔒 Skip half-baked stroke elements (only a dot).
+        if (
+          this.isStrokeElement(element) &&
+          (!Array.isArray((element as any).points) ||
+            (element as any).points.length < 2)
+        ) {
+          continue;
+        }
+
         this.setElementYMap(element, { replacePoints: true });
       }
     }, origin);
@@ -217,7 +231,10 @@ export default class YjsProvider {
 
   // Helper: set element fields inside a Y.Map so concurrent field updates merge
   // If replacePoints=true and element.points is an array, replace the Y.Array contents.
-  private setElementYMap(element: ExcalidrawElement, opts?: { replacePoints?: boolean }) {
+  private setElementYMap(
+    element: ExcalidrawElement,
+    opts?: { replacePoints?: boolean },
+  ) {
     let ym = this.elementsMap.get(element.id) as Y.Map<any> | undefined;
     if (!ym) {
       ym = new Y.Map();
@@ -229,23 +246,29 @@ export default class YjsProvider {
     // set/update fields; treat 'points' and 'text' specially
     Object.entries(element).forEach(([k, v]) => {
       if (k === "points") {
-        // if caller wants to replace points, swap into a Y.Array (clear/push)
         if (opts?.replacePoints) {
-          // ensure Y.Array exists and replace contents
           let ypoints = ym!.get("points") as Y.Array<any> | undefined;
+
+          const arr = Array.isArray(v) ? v : [];
+          const len = arr.length;
+          const isStroke = this.isStrokeElement(element);
+
+          // 🔒 For stroke-like elements, ignore point updates that don't have at least 2 points.
+          if (isStroke && len < 2) {
+            return;
+          }
+
           if (!ypoints) {
             ypoints = new Y.Array();
             ym!.set("points", ypoints);
           } else {
-            // clear existing
             ypoints.delete(0, ypoints.length);
           }
-          if (Array.isArray(v) && v.length > 0) {
-            ypoints.push(v);
+          if (len > 0) {
+            ypoints.push(arr);
           }
         } else {
-          // if replacePoints not requested, just ignore setting full points here
-          // (incremental appends should use writePoints)
+          // if replacePoints not requested, ignore; incremental appends go via writePoints
         }
       } else if (k === "text") {
         // use Y.Text for collaborative text (if present as string)
@@ -273,6 +296,17 @@ export default class YjsProvider {
   // Callback registration
   onElementsChanged(cb: ElementsChangeCallback) {
     this.onElementsCb = cb;
+
+    // 🔹 Optional but useful: immediately emit current doc contents for late joiners
+    try {
+      const elements = this.readAllElements();
+      if (elements && elements.length > 0) {
+        cb(elements);
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[yjsprovider] initial onElementsChanged failed", e);
+    }
   }
 
   onAwareness(cb: AwarenessChangeCallback) {
@@ -283,6 +317,11 @@ export default class YjsProvider {
     if (this.onElementsCb) {
       try {
         const elements = this.readAllElements();
+        console.debug("[yjs] _onYChange -> readAllElements", {
+          len: elements?.length ?? 0,
+          ts: Date.now(),
+          roomId: this.roomId,
+        });
         this.onElementsCb(elements);
       } catch (e) {
         // eslint-disable-next-line no-console
@@ -294,7 +333,9 @@ export default class YjsProvider {
   private _onAwarenessChange = () => {
     if (!this.provider) return;
     const awareness = (this.provider as any).awareness;
-    const states = new Map<number, any>(Array.from(awareness.getStates().entries()));
+    const states = new Map<number, any>(
+      Array.from(awareness.getStates().entries()),
+    );
     this.onAwarenessCb && this.onAwarenessCb(states);
   };
 
@@ -310,7 +351,11 @@ export default class YjsProvider {
   // Helpful runtime helper for debug: returns an id identifying this client
   getClientID(): number | null {
     try {
-      return (this.provider as any)?.awareness?.clientID ?? (this.doc as any).clientID ?? null;
+      return (
+        (this.provider as any)?.awareness?.clientID ??
+        (this.doc as any).clientID ??
+        null
+      );
     } catch (_) {
       return null;
     }

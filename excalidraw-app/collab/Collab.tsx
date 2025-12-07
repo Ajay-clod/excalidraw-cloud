@@ -1,33 +1,17 @@
 /**
- * excalidraw-app/collab/Collab.tsx (Yjs-only variant) — combined final (fixed types)
+ * Pure-Yjs collaboration layer for Excalidraw.
  *
- * This file includes:
- * - Yjs-only collaboration wiring
- * - Robust pointerdown/pointerup bound handlers
- * - Initial scene promise resolution when first Yjs snapshot arrives
- * - Queueing of remote snapshots while local pointer is down
- * - Debounced writer with reliable flush handlers
- * - Integration with YjsProvider.writePoints for incremental stroke updates
- * - Final commit on pointerup to write full elements
- *
- * Note: This file expects YjsProvider (excalidraw-app/collab/YjsProvider.ts) to expose:
- * - init(roomId, wsUrl, opts)
- * - writeElements(elements)
- * - writePoints(elementId, pointsBatch)
- * - onElementsChanged(cb)
- * - onAwareness(cb)
- * - getStatus()
- * - destroy()
- *
- * Keep logging minimal in production.
+ * - Yjs is the single source of truth for the scene.
+ * - Excalidraw local changes are periodically written as full-scene snapshots.
+ * - Remote Yjs updates are applied safely, with a queue while the user is drawing.
+ * - Cursors / presence use Yjs awareness (no portal / WS scene broadcast).
+ * - Firebase is still used for persistence (save/load by room).
  */
 
 import {
   CaptureUpdateAction,
   getSceneVersion,
   restoreElements,
-  zoomToFitBounds,
-  reconcileElements,
 } from "@excalidraw/excalidraw";
 import { ErrorDialog } from "@excalidraw/excalidraw/components/ErrorDialog";
 import { APP_NAME, EVENT } from "@excalidraw/common";
@@ -35,14 +19,12 @@ import {
   IDLE_THRESHOLD,
   ACTIVE_THRESHOLD,
   UserIdleState,
-  assertNever,
   isDevEnv,
   isTestEnv,
   preventUnload,
   resolvablePromise,
   throttleRAF,
 } from "@excalidraw/common";
-import { decryptData } from "@excalidraw/excalidraw/data/encryption";
 import { getVisibleSceneBounds } from "@excalidraw/element";
 import { newElementWith } from "@excalidraw/element";
 import { isImageElement, isInitializedImageElement } from "@excalidraw/element";
@@ -53,10 +35,6 @@ import { withBatchedUpdates } from "@excalidraw/excalidraw/reactUtils";
 import throttle from "lodash.throttle";
 import { PureComponent } from "react";
 
-import type {
-  ReconciledExcalidrawElement,
-  RemoteExcalidrawElement,
-} from "@excalidraw/excalidraw/data/reconcile";
 import type { ImportedDataState } from "@excalidraw/excalidraw/data/types";
 import type {
   ExcalidrawElement,
@@ -71,7 +49,7 @@ import type {
   Collaborator,
   Gesture,
 } from "@excalidraw/excalidraw/types";
-import type { Mutable, ValueOf } from "@excalidraw/common/utility-types";
+import type { Mutable } from "@excalidraw/common/utility-types";
 
 import { appJotaiStore, atom } from "../app-jotai";
 import {
@@ -80,9 +58,7 @@ import {
   FIREBASE_STORAGE_PREFIXES,
   INITIAL_SCENE_UPDATE_TIMEOUT,
   LOAD_IMAGES_TIMEOUT,
-  WS_SUBTYPES,
   SYNC_FULL_SCENE_INTERVAL_MS,
-  WS_EVENTS,
 } from "../app_constants";
 import {
   generateCollaborationLinkData,
@@ -111,14 +87,9 @@ import { resetBrowserStateVersions } from "../data/tabSync";
 import { collabErrorIndicatorAtom } from "./CollabError";
 import Portal from "./Portal";
 
-import type {
-  SocketUpdateDataSource,
-  SyncableExcalidrawElement,
-} from "../data";
+import type { SocketUpdateDataSource, SyncableExcalidrawElement } from "../data";
 
-/* === YjsProvider import ===
-   This is the local provider wrapper file (YjsProvider.ts).
-*/
+/* === YjsProvider import === */
 import YjsProvider from "./YjsProvider";
 
 export const collabAPIAtom = atom<CollabAPI | null>(null);
@@ -173,72 +144,20 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   /* === Yjs provider property === */
   private yjsProvider: YjsProvider | null = null;
 
-  // Minimal flags/state for safe apply
+  // Pointer state (so we know when NOT to apply remote scenes / NOT to write)
+  private _localPointerDown: boolean = false;
+  private _pointerDownWatchdogId?: number;
+
+  // Remote apply state (Yjs → Excalidraw)
   private _applyingRemote: boolean = false;
   private _pendingRemoteElements: ReadonlyArray<any> | null = null;
-  private _localPointerDown: boolean = false;
-  private _yjsHandlersAttached: boolean = false;
 
-  // Debounce writer state (kept readonly to match incoming signatures)
-  private _debouncedWrite?: ((elements: readonly any[]) => void) & { flush?: () => void };
-  private _debounceTimer: any = null;
-  private _debounceLastArgs: readonly any[] | null = null;
-
-  // Bound handlers so we can reliably add/remove listeners
-  private _onPointerDownBound = () => {
-    this._localPointerDown = true;
-  };
-  private _onPointerUpBound = () => {
-    this._localPointerDown = false;
-    // if any pending snapshot queued while drawing, apply it now
-    try {
-      if (this._pendingRemoteElements && this.excalidrawAPI) {
-        const queued = this._pendingRemoteElements;
-        this._pendingRemoteElements = null;
-        const restored = restoreElements(queued as any, null);
-        this.excalidrawAPI.updateScene({
-          elements: restored,
-          captureUpdate: CaptureUpdateAction.NEVER,
-        });
-        this.loadImageFiles();
-      }
-    } catch (e) {
-      /* non-fatal */
-    }
-
-    // commit any in-progress local strokes to Yjs as final elements
-    try {
-      this._commitInProgressElements();
-    } catch (e) {
-      console.warn("[collab] commitInProgressElements failed", e);
-    }
-
-    // flush any debounced writes (if present)
-    try {
-      this._debouncedWrite && this._debouncedWrite.flush && this._debouncedWrite.flush();
-    } catch (_) {}
-  };
-  private _flushDebouncedWriteBound = () => {
-    try {
-      this._debouncedWrite && this._debouncedWrite.flush && this._debouncedWrite.flush();
-    } catch (_) {}
-  };
-  private _onVisibilityHiddenFlushBound = () => {
-    if (document.visibilityState === "hidden") {
-      this._flushDebouncedWriteBound();
-    }
-  };
-
-  // initial scene promise state (so Yjs flow resolves startCollaboration)
+  // Initial scene promise (so startCollaboration() resolves when we first get Yjs state)
   private _initialScenePromise?: {
     resolve: (value: InitialScene | Promise<InitialScene>) => void;
     reject: (error: Error) => void;
   };
   private _initialScenePromiseResolved: boolean = false;
-
-  // NEW: incremental point sync tracking
-  private _lastPointsCount: Map<string, number> = new Map();
-  private _inProgressElementIds: Set<string> = new Set();
 
   constructor(props: CollabProps) {
     super(props);
@@ -248,6 +167,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       username: importUsernameFromLocalStorage() || "",
       activeRoomLink: null,
     };
+
     this.portal = new Portal(this);
     this.fileManager = new FileManager({
       getFiles: async (fileIds) => {
@@ -297,6 +217,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
         };
       },
     });
+
     this.excalidrawAPI = props.excalidrawAPI;
     this.activeIntervalId = null;
     this.idleTimeoutId = null;
@@ -304,31 +225,117 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
   private onUmmount: (() => void) | null = null;
 
+  // ===== Pointer handlers =====
+
+  private _onPointerDownBound = () => {
+    this._localPointerDown = true;
+
+    // watchdog: avoid stuck pointerDown if pointerUp never fires
+    if (this._pointerDownWatchdogId) {
+      clearTimeout(this._pointerDownWatchdogId);
+    }
+    this._pointerDownWatchdogId = window.setTimeout(() => {
+      if (this._localPointerDown) {
+        console.warn(
+          "[collab] pointerdown watchdog fired — clearing stuck pointer state",
+        );
+        this._localPointerDown = false;
+
+        // If there were pending remote elements, apply them now
+        if (this._pendingRemoteElements) {
+          const queued = this._pendingRemoteElements;
+          this._pendingRemoteElements = null;
+          this._applyYjsElements(queued);
+        }
+      }
+      this._pointerDownWatchdogId = undefined;
+    }, 30000);
+  };
+
+  private _onPointerUpBound = () => {
+    this._localPointerDown = false;
+
+    // apply any remote Yjs scene that was queued while drawing
+    if (this._pendingRemoteElements) {
+      const queued = this._pendingRemoteElements;
+      this._pendingRemoteElements = null;
+      this._applyYjsElements(queued);
+    }
+
+    // clear watchdog
+    if (this._pointerDownWatchdogId) {
+      clearTimeout(this._pointerDownWatchdogId);
+      this._pointerDownWatchdogId = undefined;
+    }
+
+    // after finishing a stroke, we can safely sync the full scene to Yjs
+    this._writeFullSceneToYjsSafe();
+  };
+
+  private _onPointerCancelBound = () => {
+    // treat pointercancel like pointerup
+    this._localPointerDown = false;
+
+    if (this._pendingRemoteElements) {
+      const queued = this._pendingRemoteElements;
+      this._pendingRemoteElements = null;
+      this._applyYjsElements(queued);
+    }
+
+    if (this._pointerDownWatchdogId) {
+      clearTimeout(this._pointerDownWatchdogId);
+      this._pointerDownWatchdogId = undefined;
+    }
+
+    this._writeFullSceneToYjsSafe();
+  };
+
+  private _onWindowBlurBound = () => {
+    if (this._localPointerDown) {
+      this._onPointerCancelBound();
+    }
+  };
+
   componentDidMount() {
     window.addEventListener(EVENT.BEFORE_UNLOAD, this.beforeUnload);
     window.addEventListener("online", this.onOfflineStatusToggle);
     window.addEventListener("offline", this.onOfflineStatusToggle);
     window.addEventListener(EVENT.UNLOAD, this.onUnload);
 
-    // track pointer state so we don't apply incoming snapshots mid-stroke
-    window.addEventListener("pointerdown", this._onPointerDownBound, { passive: true });
-    window.addEventListener("pointerup", this._onPointerUpBound, { passive: true });
-
-    const unsubOnUserFollow = this.excalidrawAPI.onUserFollow((payload) => {
-      this.portal.socket && this.portal.broadcastUserFollowed(payload);
+    // pointer tracking
+    window.addEventListener("pointerdown", this._onPointerDownBound, {
+      passive: true,
     });
+    window.addEventListener("pointerup", this._onPointerUpBound, {
+      passive: true,
+    });
+    window.addEventListener("pointercancel", this._onPointerCancelBound, {
+      passive: true,
+    });
+    window.addEventListener("pointerleave", this._onPointerCancelBound, {
+      passive: true,
+    });
+    window.addEventListener("blur", this._onWindowBlurBound);
+
+    const unsubOnUserFollow = this.excalidrawAPI.onUserFollow(() => {
+      // In pure-Yjs mode, following can be implemented via awareness if desired.
+      // For now we no-op here.
+    });
+
     const throttledRelayUserViewportBounds = throttleRAF(
       this.relayVisibleSceneBounds,
     );
     const unsubOnScrollChange = this.excalidrawAPI.onScrollChange(() =>
       throttledRelayUserViewportBounds(),
     );
+
     this.onUmmount = () => {
       unsubOnUserFollow();
       unsubOnScrollChange();
     };
 
     this.onOfflineStatusToggle();
+    this.initializeIdleDetector();
 
     const collabAPI: CollabAPI = {
       isCollaborating: this.isCollaborating,
@@ -371,13 +378,17 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       this.onVisibilityChange,
     );
 
-    // remove bound pointer handlers reliably
+    // pointer handlers
     window.removeEventListener("pointerdown", this._onPointerDownBound);
     window.removeEventListener("pointerup", this._onPointerUpBound);
+    window.removeEventListener("pointercancel", this._onPointerCancelBound);
+    window.removeEventListener("pointerleave", this._onPointerCancelBound);
+    window.removeEventListener("blur", this._onWindowBlurBound);
 
-    // remove flush handlers registered by ensureDebouncedWrite
-    window.removeEventListener("pointerup", this._flushDebouncedWriteBound);
-    document.removeEventListener("visibilitychange", this._onVisibilityHiddenFlushBound);
+    if (this._pointerDownWatchdogId) {
+      clearTimeout(this._pointerDownWatchdogId);
+      this._pointerDownWatchdogId = undefined;
+    }
 
     if (this.activeIntervalId) {
       window.clearInterval(this.activeIntervalId);
@@ -397,7 +408,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   };
 
   private onUnload = () => {
-    this.destroySocketClient({ isUnload: true });
+    this.destroyCollab({ isUnload: true });
   };
 
   private beforeUnload = withBatchedUpdates((event: BeforeUnloadEvent) => {
@@ -411,7 +422,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
         !isSavedToFirebase(this.portal, syncableElements))
     ) {
       // this won't run in time if user decides to leave the site, but
-      //  the purpose is to run in immediately after user decides to stay
+      // the purpose is to run immediately after user decides to stay
       this.saveCollabRoomToFirebase(syncableElements);
 
       if (import.meta.env.VITE_APP_DISABLE_PREVENT_UNLOAD !== "true") {
@@ -437,7 +448,11 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       this.resetErrorIndicator();
 
       if (this.isCollaborating() && storedElements) {
-        this.handleRemoteSceneUpdate(this._reconcileElements(storedElements));
+        const restored = restoreElements(storedElements, null);
+        this.excalidrawAPI.updateScene({
+          elements: restored,
+          captureUpdate: CaptureUpdateAction.NEVER,
+        });
       }
     } catch (error: any) {
       const errorMessage = /is longer than.*?bytes/.test(error.message)
@@ -466,7 +481,6 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   };
 
   stopCollaboration = (keepRemoteState = true) => {
-    this.queueBroadcastAllElements.cancel();
     this.queueSaveToFirebase.cancel();
     this.loadImageFiles.cancel();
     this.resetErrorIndicator(true);
@@ -479,23 +493,26 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
     if (!keepRemoteState) {
       LocalData.fileStorage.reset();
-      this.destroySocketClient();
+      this.destroyCollab();
     } else if (window.confirm(t("alerts.collabStopOverridePrompt"))) {
       // hack to ensure that we prefer we disregard any new browser state
       // that could have been saved in other tabs while we were collaborating
       resetBrowserStateVersions();
 
       window.history.pushState({}, APP_NAME, window.location.origin);
-      this.destroySocketClient();
+      this.destroyCollab();
 
       LocalData.fileStorage.reset();
 
-      const elements = this.excalidrawAPI.getSceneElementsIncludingDeleted().map((element) => {
-        if (isImageElement(element) && element.status === "saved") {
-          return newElementWith(element, { status: "pending" });
-        }
-        return element;
-      });
+      const elements =
+        this.excalidrawAPI.getSceneElementsIncludingDeleted().map(
+          (element) => {
+            if (isImageElement(element) && element.status === "saved") {
+              return newElementWith(element, { status: "pending" });
+            }
+            return element;
+          },
+        );
 
       this.excalidrawAPI.updateScene({
         elements,
@@ -504,21 +521,17 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     }
   };
 
-  private destroySocketClient = (opts?: { isUnload: boolean }) => {
+  private destroyCollab = (opts?: { isUnload: boolean }) => {
     this.lastBroadcastedOrReceivedSceneVersion = -1;
     this.portal.close();
     this.fileManager.reset();
 
-    /* Cleanup Yjs provider if present */
     if (!opts?.isUnload && this.yjsProvider) {
       try {
         this.yjsProvider.destroy();
-      } catch (e) {
+      } catch {
         // ignore
       } finally {
-        this._yjsHandlersAttached = false;
-        this._pendingRemoteElements = null;
-        this._applyingRemote = false;
         this.yjsProvider = null;
       }
     }
@@ -555,27 +568,6 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     return await this.fileManager.getFiles(unfetchedImages);
   };
 
-  private decryptPayload = async (
-    iv: Uint8Array,
-    encryptedData: ArrayBuffer,
-    decryptionKey: string,
-  ): Promise<ValueOf<SocketUpdateDataSource>> => {
-    try {
-      const decrypted = await decryptData(iv, encryptedData, decryptionKey);
-
-      const decodedData = new TextDecoder("utf-8").decode(
-        new Uint8Array(decrypted),
-      );
-      return JSON.parse(decodedData);
-    } catch (error) {
-      window.alert(t("alerts.decryptFailed"));
-      console.error(error);
-      return {
-        type: WS_SUBTYPES.INVALID_RESPONSE,
-      };
-    }
-  };
-
   private fallbackInitializationHandler: null | (() => any) = null;
 
   startCollaboration = async (
@@ -588,13 +580,14 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       });
     }
 
+    // If portal.socket is used in your app elsewhere, we deliberately keep it null
+    // and rely entirely on Yjs for realtime scene sync.
     if (this.portal.socket) {
-      // If some socket is already opened, don't start again.
       return null;
     }
 
-    let roomId;
-    let roomKey;
+    let roomId: string;
+    let roomKey: string;
 
     if (existingRoomLinkData) {
       ({ roomId, roomKey } = existingRoomLinkData);
@@ -626,155 +619,61 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     };
     this.fallbackInitializationHandler = fallbackInitializationHandler;
 
-    // --- safe ws url computation (single normalized value) ---
+    // Resolve Yjs WebSocket endpoint once, for all instances.
     const envYjs = (import.meta.env as any)?.VITE_APP_YJS_WSS;
     const envWsServer = (import.meta.env as any)?.VITE_APP_WS_SERVER_URL;
 
     const normalizedEnvYjs =
-      typeof envYjs === "string" && envYjs.trim().length > 0 ? envYjs.trim() : null;
+      typeof envYjs === "string" && envYjs.trim().length > 0
+        ? envYjs.trim()
+        : null;
     const normalizedEnvWsServer =
-      typeof envWsServer === "string" && envWsServer.trim().length > 0 ? envWsServer.trim() : null;
+      typeof envWsServer === "string" && envWsServer.trim().length > 0
+        ? envWsServer.trim()
+        : null;
 
-    const wsServerUrl = normalizedEnvYjs || normalizedEnvWsServer || "ws://localhost:1234";
+    const wsServerUrl =
+      normalizedEnvYjs || normalizedEnvWsServer || "ws://localhost:1234";
     console.info("[collab] resolved wsServerUrl:", wsServerUrl, "room:", roomId);
 
-    // Yjs-only path: don't instantiate shim. Set portal.roomId/roomKey so FileManager works.
+    // Set portal room data for Firebase, but we won't use portal sockets.
     this.portal.roomId = roomId;
     this.portal.roomKey = roomKey;
-    // Keep portal.socket null (no shim)
     this.portal.socket = null;
 
     try {
       const wsUrlForYjs = wsServerUrl;
-      console.info("[collab] Yjs websocket URL:", wsUrlForYjs, "room:", roomId);
+      console.info(
+        "[collab] Yjs websocket URL:",
+        wsUrlForYjs,
+        "room:",
+        roomId,
+      );
 
       this.yjsProvider = new YjsProvider();
+      await this.yjsProvider.init(roomId, wsUrlForYjs, {
+        persist: true,
+        roomKey,
+      });
 
-      // try to init; if it fails, fallback to firebase-based initialization
-      await this.yjsProvider.init(roomId, wsUrlForYjs, { persist: true, roomKey });
-
-      // provider initialized; mark portal as initialized so other code relying on socketInitialized proceeds
+      // Mark "socket" initialized so Firebase saving logic is enabled.
       this.portal.socketInitialized = true;
 
-      // ensure instance-scoped guard/queue exist so they persist and are unique per Collab instance
-      (this as any)._applyingRemote = (this as any)._applyingRemote || false;
-      (this as any)._pendingRemoteElements = (this as any)._pendingRemoteElements || null;
-
-      const applyRemoteElementsSafely = (elements: readonly any[]) => {
-        // If excalidraw API not ready yet, keep last remote snapshot for later
-        if (!this.excalidrawAPI || typeof this._reconcileElements !== "function") {
-          (this as any)._pendingRemoteElements = elements;
-          console.info("[collab] excalidrawAPI not ready — queued remote elements:", elements?.length ?? 0);
-          return;
-        }
-
-        // Prevent re-entrancy
-        if ((this as any)._applyingRemote) {
-          (this as any)._pendingRemoteElements = elements;
-          console.debug("[collab] skipping re-entrant onElementsChanged; queued latest remote elements:", elements?.length ?? 0);
-          return;
-        }
-
-        (this as any)._applyingRemote = true;
-
-        // Defer actual reconcile+apply to next animation frame to avoid nested React updates
-        window.requestAnimationFrame(() => {
-          try {
-            const reconciled = this._reconcileElements(elements);
-            // resolve startCollaboration scenePromise if present (only once)
-            try {
-              if (this._initialScenePromise && !this._initialScenePromiseResolved) {
-                this._initialScenePromiseResolved = true;
-                this._initialScenePromise.resolve({
-                  elements: reconciled,
-                  scrollToContent: true,
-                });
-                // clear the initialization fallback timer if present
-                if (this.socketInitializationTimer) {
-                  clearTimeout(this.socketInitializationTimer);
-                  this.socketInitializationTimer = undefined;
-                }
-              }
-            } catch (e) {
-              console.warn("[collab] resolving initial scene promise failed", e);
-            }
-            // handleRemoteSceneUpdate should call excalidrawAPI.updateScene with CaptureUpdateAction.NEVER
-            this.handleRemoteSceneUpdate(reconciled);
-            console.info("[collab] applied remote elements:", reconciled.length);
-          } catch (err) {
-            console.error("[collab] Failed to handle Yjs elements", err);
-          } finally {
-            setTimeout(() => {
-              (this as any)._applyingRemote = false;
-              const pending = (this as any)._pendingRemoteElements;
-              (this as any)._pendingRemoteElements = null;
-              if (pending) {
-                applyRemoteElementsSafely(pending as readonly any[]);
-              }
-            }, 0);
-          }
-        });
-      };
-
-      // Register exactly one handler
+      // === Yjs → Excalidraw scene updates ===
       this.yjsProvider.onElementsChanged((elements: any[]) => {
-        try {
-          // If pointer is down, queue snapshot (we already track local pointer via handlers)
-          if (this._localPointerDown) {
-            this._pendingRemoteElements = elements;
-            console.debug("[collab] queued remote elements while pointer is down:", elements?.length ?? 0);
-            return;
-          }
-          applyRemoteElementsSafely(elements);
-        } catch (e) {
-          console.error("[collab] onElementsChanged handler error", e);
-        }
+        this._onYjsElementsChanged(elements);
       });
 
-      // If pending elements exist and excalidrawAPI is ready now, apply them immediately
-      if ((this as any)._pendingRemoteElements && this.excalidrawAPI) {
-        const queued = (this as any)._pendingRemoteElements;
-        (this as any)._pendingRemoteElements = null;
-        applyRemoteElementsSafely(queued as readonly any[]);
-      }
-
-      // Awareness -> convert to collaborators map for UI, mark local client where possible
+      // === Yjs awareness → collaborators map ===
       this.yjsProvider.onAwareness((states: Map<number, any>) => {
-        try {
-          const collaboratorsMap = new Map<SocketId, Collaborator>();
-
-          // try to detect local client id from provider (best-effort)
-          const provider = (this.yjsProvider?.getStatus?.().provider) || null;
-          let localClientId: number | null = null;
-          try {
-            localClientId = (provider && provider.awareness && provider.awareness.clientID) ?? (this.yjsProvider as any).doc?.clientID ?? null;
-          } catch (_) {
-            localClientId = null;
-          }
-
-          for (const [clientId, state] of Array.from(states.entries())) {
-            collaboratorsMap.set(String(clientId) as unknown as SocketId, {
-              ...state,
-              isCurrentUser: localClientId !== null ? clientId === localClientId : false,
-            } as Collaborator);
-          }
-          this.collaborators = collaboratorsMap;
-          this.excalidrawAPI.updateScene({ collaborators: this.collaborators });
-        } catch (e) {
-          console.warn("Error mapping Yjs awareness to collaborators", e);
-        }
+        this._onYjsAwarenessChanged(states);
       });
-
-
-      // If you want to emit first-in-room or similar, you can derive it from awareness states here.
-
-      // If yjsProvider is available we may want to resolve initial scene from it:
-      // Wait a beat for IndexedDB sync to complete if persistence is enabled; otherwise rely on onElementsChanged to arrive.
-      // To be conservative, do not resolve scenePromise here immediately; the onElementsChanged will call handleRemoteSceneUpdate instead.
     } catch (e) {
-      console.warn("YjsProvider init failed, falling back to Firebase-based init", e);
+      console.warn(
+        "YjsProvider init failed, falling back to Firebase-based init",
+        e,
+      );
       this.yjsProvider = null;
-      // run fallback to initialize from firebase
       try {
         fallbackInitializationHandler();
       } catch (err) {
@@ -782,19 +681,12 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       }
     }
 
-    // If the rest of the app expects socket events (client-broadcast etc), we are no-op there
-    // because we don't instantiate shim — any code relying on shim-emitted client-broadcast will not run.
-
-    // Start a timer that falls back to firebase init if nothing happened
+    // Fallback timer if Yjs doesn't deliver a scene in time.
     this.socketInitializationTimer = window.setTimeout(
       fallbackInitializationHandler,
       INITIAL_SCENE_UPDATE_TIMEOUT,
     );
 
-    // NOTE: we removed shim-based socket listeners; portal.socket remains null.
-    // The prior client-broadcast listener used to be set up here — it's removed in Yjs-only flow.
-
-    // Set active room link and return scenePromise; onElementsChanged will drive updates
     this.setActiveRoomLink(window.location.href);
 
     return scenePromise;
@@ -811,7 +703,6 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     | { fetchScene: false; roomLinkData?: null }) => {
     clearTimeout(this.socketInitializationTimer!);
 
-    // No shim socket to remove connect_error handler from; if portal.socket existed we'd do so
     if (fetchScene && roomLinkData && this.portal.socket) {
       this.excalidrawAPI.resetScene();
 
@@ -837,29 +728,142 @@ class Collab extends PureComponent<CollabProps, CollabState> {
         this.portal.socketInitialized = true;
       }
     } else {
-      // If using Yjs-only, mark socketInitialized so other flows proceed
+      // Yjs-only mode: mark as initialized for Firebase save logic
       this.portal.socketInitialized = true;
     }
     return null;
   };
 
-  private _reconcileElements = (
-    remoteElements: readonly ExcalidrawElement[],
-  ): ReconciledExcalidrawElement[] => {
-    const localElements = this.getSceneElementsIncludingDeleted();
-    const appState = this.excalidrawAPI.getAppState();
-    const restoredRemoteElements = restoreElements(remoteElements, null);
-    const reconciledElements = reconcileElements(
-      localElements,
-      restoredRemoteElements as RemoteExcalidrawElement[],
-      appState,
-    );
+  // ===== Yjs → Excalidraw helpers =====
 
-    this.setLastBroadcastedOrReceivedSceneVersion(
-      getSceneVersion(reconciledElements),
-    );
+  private _onYjsElementsChanged = (elements: any[]) => {
+    try {
+      console.debug("[collab] onElementsChanged received", {
+        len: elements?.length ?? 0,
+        localPointerDown: this._localPointerDown,
+        ts: Date.now(),
+      });
 
-    return reconciledElements;
+      if (this._localPointerDown) {
+        // Don’t override the scene while the user is drawing;
+        // queue the last remote snapshot instead.
+        this._pendingRemoteElements = elements;
+        console.debug(
+          "[collab] queued remote elements while pointer is down:",
+          elements?.length ?? 0,
+        );
+        return;
+      }
+
+      this._applyYjsElements(elements);
+    } catch (e) {
+      console.error("[collab] onElementsChanged handler error", e);
+    }
+  };
+
+  private _applyYjsElements = (elements: readonly any[]) => {
+    if (!elements) return;
+
+    if (this._applyingRemote) {
+      this._pendingRemoteElements = elements;
+      return;
+    }
+
+    if (this._localPointerDown) {
+      this._pendingRemoteElements = elements;
+      return;
+    }
+
+    this._applyingRemote = true;
+    try {
+      const restored = restoreElements(elements as any, null);
+
+      // Resolve initial scene promise exactly once
+      if (this._initialScenePromise && !this._initialScenePromiseResolved) {
+        this._initialScenePromiseResolved = true;
+        this._initialScenePromise.resolve({
+          elements: restored,
+          scrollToContent: true,
+        });
+
+        if (this.socketInitializationTimer) {
+          clearTimeout(this.socketInitializationTimer);
+          this.socketInitializationTimer = undefined;
+        }
+      }
+
+      this.excalidrawAPI.updateScene({
+        elements: restored,
+        captureUpdate: CaptureUpdateAction.NEVER,
+      });
+
+      this.loadImageFiles();
+    } catch (err) {
+      console.error("[collab] failed to apply Yjs elements", err);
+    } finally {
+      this._applyingRemote = false;
+
+      // If new remote elements arrived while we were applying, and we're not drawing,
+      // immediately apply the latest snapshot.
+      if (!this._localPointerDown && this._pendingRemoteElements) {
+        const pending = this._pendingRemoteElements;
+        this._pendingRemoteElements = null;
+        this._applyYjsElements(pending);
+      }
+    }
+  };
+
+  private _onYjsAwarenessChanged = (states: Map<number, any>) => {
+    try {
+      const collaboratorsMap = new Map<SocketId, Collaborator>();
+
+      const status = this.yjsProvider?.getStatus();
+      const provider = (status?.provider as any) || null;
+      let localClientId: number | null = null;
+
+      try {
+        localClientId =
+          (provider &&
+            provider.awareness &&
+            provider.awareness.clientID) ??
+          (this.yjsProvider as any).doc?.clientID ??
+          null;
+      } catch {
+        localClientId = null;
+      }
+
+      for (const [clientId, state] of Array.from(states.entries())) {
+        collaboratorsMap.set(
+          String(clientId) as unknown as SocketId,
+          {
+            ...state,
+            isCurrentUser:
+              localClientId !== null ? clientId === localClientId : false,
+          } as Collaborator,
+        );
+      }
+
+      this.collaborators = collaboratorsMap;
+      this.excalidrawAPI.updateScene({
+        collaborators: this.collaborators,
+      });
+    } catch (e) {
+      console.warn("Error mapping Yjs awareness to collaborators", e);
+    }
+  };
+
+  // ===== Scene utilities =====
+
+  public setLastBroadcastedOrReceivedSceneVersion = (version: number) => {
+    this.lastBroadcastedOrReceivedSceneVersion = version;
+  };
+
+  public getLastBroadcastedOrReceivedSceneVersion = () => {
+    return this.lastBroadcastedOrReceivedSceneVersion;
+  };
+
+  public getSceneElementsIncludingDeleted = () => {
+    return this.excalidrawAPI.getSceneElementsIncludingDeleted();
   };
 
   private loadImageFiles = throttle(async () => {
@@ -876,17 +880,6 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       elements: this.excalidrawAPI.getSceneElementsIncludingDeleted(),
     });
   }, LOAD_IMAGES_TIMEOUT);
-
-  private handleRemoteSceneUpdate = (
-    elements: ReconciledExcalidrawElement[],
-  ) => {
-    this.excalidrawAPI.updateScene({
-      elements,
-      captureUpdate: CaptureUpdateAction.NEVER,
-    });
-
-    this.loadImageFiles();
-  };
 
   private onPointerMove = () => {
     if (this.idleTimeoutId) {
@@ -939,7 +932,10 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
   private initializeIdleDetector = () => {
     document.addEventListener(EVENT.POINTER_MOVE, this.onPointerMove);
-    document.addEventListener(EVENT.VISIBILITY_CHANGE, this.onVisibilityChange);
+    document.addEventListener(
+      EVENT.VISIBILITY_CHANGE,
+      this.onVisibilityChange,
+    );
   };
 
   setCollaborators(sockets: SocketId[]) {
@@ -949,7 +945,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       collaborators.set(
         socketId,
         Object.assign({}, this.collaborators.get(socketId), {
-          isCurrentUser: socketId === this.portal.socket?.id,
+          isCurrentUser: false,
         }),
       );
     }
@@ -957,14 +953,17 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     this.excalidrawAPI.updateScene({ collaborators });
   }
 
-  updateCollaborator = (socketId: SocketId, updates: Partial<Collaborator>) => {
+  updateCollaborator = (
+    socketId: SocketId,
+    updates: Partial<Collaborator>,
+  ) => {
     const collaborators = new Map(this.collaborators);
     const user: Mutable<Collaborator> = Object.assign(
       {},
       collaborators.get(socketId),
       updates,
       {
-        isCurrentUser: socketId === this.portal.socket?.id,
+        isCurrentUser: false,
       },
     );
     collaborators.set(socketId, user);
@@ -975,19 +974,8 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     });
   };
 
-  public setLastBroadcastedOrReceivedSceneVersion = (version: number) => {
-    this.lastBroadcastedOrReceivedSceneVersion = version;
-  };
+  // ===== Cursors / presence (via Yjs awareness) =====
 
-  public getLastBroadcastedOrReceivedSceneVersion = () => {
-    return this.lastBroadcastedOrReceivedSceneVersion;
-  };
-
-  public getSceneElementsIncludingDeleted = () => {
-    return this.excalidrawAPI.getSceneElementsIncludingDeleted();
-  };
-
-  /* onPointerUpdate now prefers Yjs awareness */
   onPointerUpdate = throttle(
     (payload: {
       pointer: SocketUpdateDataSource["MOUSE_LOCATION"]["payload"]["pointer"];
@@ -995,247 +983,125 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       pointersMap: Gesture["pointers"];
     }) => {
       try {
+        const status = this.yjsProvider?.getStatus();
+        const provider = status?.provider as any;
         if (
-          this.yjsProvider &&
-          this.yjsProvider.getStatus().provider &&
+          provider &&
+          provider.awareness &&
+          typeof provider.awareness.setLocalState === "function" &&
           payload.pointersMap.size < 2
         ) {
-          const provider = (this.yjsProvider.getStatus().provider as any);
-          if (provider && provider.awareness && provider.awareness.setLocalState) {
-            provider.awareness.setLocalState({
-              pointer: payload.pointer,
-              button: payload.button,
-              username: this.state.username,
-              selectedElementIds:
-                payload.pointersMap && payload.pointersMap.size > 0
-                  ? Array.from(payload.pointersMap.keys())
-                  : [],
-            });
-            return;
-          }
+          const prev = provider.awareness.getLocalState() || {};
+          provider.awareness.setLocalState({
+            ...prev,
+            pointer: payload.pointer,
+            button: payload.button,
+            username: this.state.username,
+            selectedElementIds:
+              payload.pointersMap && payload.pointersMap.size > 0
+                ? Array.from(payload.pointersMap.keys())
+                : [],
+          });
         }
       } catch (e) {
-        // swallow and fallthrough to legacy if necessary
+        console.warn("[collab] onPointerUpdate awareness error", e);
       }
-
-      // legacy fallback only if Yjs not available
-      payload.pointersMap.size < 2 &&
-        this.portal.socket &&
-        this.portal.broadcastMouseLocation(payload);
     },
     CURSOR_SYNC_TIMEOUT,
   );
 
   relayVisibleSceneBounds = (props?: { force: boolean }) => {
+    // Optional: you can encode viewport bounds into awareness as well.
     const appState = this.excalidrawAPI.getAppState();
+    const bounds = getVisibleSceneBounds(appState);
 
-    if (this.portal.socket && (appState.followedBy.size > 0 || props?.force)) {
-      this.portal.broadcastVisibleSceneBounds(
-        {
-          sceneBounds: getVisibleSceneBounds(appState),
-        },
-        `follow@${this.portal.socket.id}`,
-      );
+    try {
+      const status = this.yjsProvider?.getStatus();
+      const provider = status?.provider as any;
+      if (!provider?.awareness?.setLocalState) return;
+
+      const prev = provider.awareness.getLocalState() || {};
+      if (props?.force || appState.followedBy.size > 0) {
+        provider.awareness.setLocalState({
+          ...prev,
+          viewportBounds: bounds,
+        });
+      }
+    } catch (e) {
+      console.warn("[collab] relayVisibleSceneBounds awareness error", e);
     }
   };
 
   onIdleStateChange = (userState: UserIdleState) => {
-    this.portal.broadcastIdleChange(userState);
-  };
-
-  broadcastElements = (elements: readonly OrderedExcalidrawElement[]) => {
-    // In Yjs mode prefer writing the canonical full scene (avoid partial races)
-    if (this.yjsProvider && typeof (this.yjsProvider as any).writeElements === "function") {
-      try {
-        const full = this.excalidrawAPI.getSceneElementsIncludingDeleted();
-        (this.yjsProvider as any).writeElements(full as any);
-        return;
-      } catch (e) {
-        console.error("Yjs writeElements failed, falling back to portal.broadcastScene", e);
-      }
-    }
-
-    // fallback: use portal transport if available
-    if (this.portal) {
-      this.portal.broadcastScene(WS_SUBTYPES.UPDATE, elements, false);
-      this.lastBroadcastedOrReceivedSceneVersion = getSceneVersion(elements);
-      this.queueBroadcastAllElements();
+    try {
+      const status = this.yjsProvider?.getStatus();
+      const provider = status?.provider as any;
+      if (!provider?.awareness?.setLocalState) return;
+      const prev = provider.awareness.getLocalState() || {};
+      provider.awareness.setLocalState({
+        ...prev,
+        idleState: userState,
+        username: this.state.username,
+      });
+    } catch (e) {
+      console.warn("[collab] onIdleStateChange awareness error", e);
     }
   };
 
-  /* Debounced writer and helpers */
-  ensureDebouncedWrite(wait = 80) {
-    if (this._debouncedWrite) return;
+  // ===== Excalidraw → Yjs sync =====
 
-    const flush = () => {
-      if (!this._debounceLastArgs) return;
-      try {
-        if (this.yjsProvider && typeof (this.yjsProvider as any).writeElements === "function") {
-          const full = this.excalidrawAPI.getSceneElementsIncludingDeleted();
-          (this.yjsProvider as any).writeElements(full as any);
-        }
-      } catch (e) {
-        console.error("[collab] debounced write failed", e);
-      }
-      this._debounceLastArgs = null;
-      clearTimeout(this._debounceTimer);
-      this._debounceTimer = null;
-    };
+  private _writeFullSceneToYjsSafe = () => {
+    if (!this.yjsProvider) return;
 
-    const debounced = (elements: readonly any[]) => {
-      this._debounceLastArgs = elements;
-      if (this._debounceTimer) {
-        clearTimeout(this._debounceTimer);
-      }
-      this._debounceTimer = setTimeout(flush, wait);
-    };
-
-    debounced.flush = flush;
-    this._debouncedWrite = debounced;
-
-    // Use stored bound flush handler so we can remove it later
-    window.addEventListener("pointerup", this._flushDebouncedWriteBound, { passive: true });
-    document.addEventListener("visibilitychange", this._onVisibilityHiddenFlushBound);
-    window.addEventListener("pagehide", this._flushDebouncedWriteBound, { passive: true });
-  }
-
-  /* Commit final state for elements that were being streamed via writePoints */
-  private _commitInProgressElements = () => {
-    if (!this.yjsProvider) {
-      this._inProgressElementIds.clear();
-      this._lastPointsCount.clear();
+    // Never write while mid-stroke
+    if (this._localPointerDown) {
       return;
     }
+
     try {
-      const providerHasWriteElements = typeof (this.yjsProvider as any).writeElements === "function";
-      if (!providerHasWriteElements) {
-        // nothing to commit; just clear memory
-        this._inProgressElementIds.clear();
-        this._lastPointsCount.clear();
-        return;
-      }
-
-      const sceneElements = this.excalidrawAPI.getSceneElementsIncludingDeleted();
-      const toCommit = sceneElements.filter((el) =>
-        this._inProgressElementIds.has((el as any).id),
-      );
-
-      if (toCommit.length > 0) {
-        try {
-          (this.yjsProvider as any).writeElements(toCommit as any);
-        } catch (e) {
-          console.error("[collab] failed to commit in-progress elements via writeElements", e);
-        }
-      }
-    } finally {
-      // clear tracking after attempt to commit
-      for (const id of Array.from(this._inProgressElementIds)) {
-        this._lastPointsCount.delete(id);
-      }
-      this._inProgressElementIds.clear();
+      const fullScene =
+        this.excalidrawAPI.getSceneElementsIncludingDeleted();
+      (this.yjsProvider as any).writeElements(fullScene as any);
+      console.debug("[collab] full scene written to Yjs", {
+        count: fullScene.length,
+      });
+    } catch (e) {
+      console.error("[collab] writeElements to Yjs failed", e);
     }
   };
 
-  /* syncElements prefers Yjs writes when available */
+  /**
+   * Excalidraw calls this on every element change.
+   * We:
+   * - ignore calls with no elements
+   * - never write while the pointer is down (stroke still evolving)
+   * - write the full scene when safe
+   */
   syncElements = (elements: readonly OrderedExcalidrawElement[]) => {
-    const hasDeletion = (elements as any[]).some((el) => (el as any).isDeleted === true);
-
-    if (this.yjsProvider && typeof (this.yjsProvider as any).writeElements === "function") {
-      this.ensureDebouncedWrite();
-
-      // If provider supports writePoints, try to push deltas for strokes
-      const providerHasWritePoints = typeof (this.yjsProvider as any).writePoints === "function";
-
-      let filteredElements = Array.from(elements) as OrderedExcalidrawElement[];
-
-      if (providerHasWritePoints) {
-        try {
-          const strokeTypes = new Set(["freedraw", "linear"]); // adjust to your element types as needed
-          for (const el of elements as any[]) {
-            if (!el || !el.id) continue;
-            const type = (el as any).type;
-            if (strokeTypes.has(type) && Array.isArray((el as any).points)) {
-              const id = el.id;
-              const prevLen = this._lastPointsCount.get(id) || 0;
-              const currLen = (el as any).points.length || 0;
-              if (currLen > prevLen) {
-                const newPoints = (el as any).points.slice(prevLen, currLen);
-                if (newPoints.length > 0) {
-                  try {
-                    (this.yjsProvider as any).writePoints(id, newPoints);
-                    // mark as in progress
-                    this._inProgressElementIds.add(id);
-                    this._lastPointsCount.set(id, currLen);
-                    // remove this element from filteredElements to avoid re-sending whole element
-                    filteredElements = filteredElements.filter((f) => (f as any).id !== id);
-                  } catch (e) {
-                    console.error("[collab] writePoints failed, will fallback to writeElements", e);
-                    this._inProgressElementIds.delete(id);
-                  }
-                }
-              }
-            }
-          }
-        } catch (e) {
-          console.warn("[collab] incremental writePoints handling errored", e);
-        }
-      }
-
-      // If there is a deletion among the supplied elements, prefer immediate full write for safety
-      if (hasDeletion) {
-        try {
-          const full = this.excalidrawAPI.getSceneElementsIncludingDeleted();
-          (this.yjsProvider as any).writeElements(full as any);
-        } catch (e) {
-          console.error("[collab] immediate Yjs write failed, falling back to broadcast", e);
-          this.broadcastElements(elements as any);
-        }
-      } else {
-        try {
-          if (filteredElements.length > 0) {
-            // Use debounced writer for remaining elements
-            this._debouncedWrite && this._debouncedWrite(filteredElements as any);
-          } else {
-            // No remaining elements to write; nothing else to do
-          }
-        } catch (e) {
-          console.error("[collab] debounced write failed, fallback to direct", e);
-          try {
-            const full = this.excalidrawAPI.getSceneElementsIncludingDeleted();
-            (this.yjsProvider as any).writeElements(full as any);
-          } catch (err) {
-            this.broadcastElements(elements as any);
-          }
-        }
-      }
-    } else {
-      this.broadcastElements(elements);
+    if (!elements || elements.length === 0) {
+      return;
     }
 
+    // If no Yjs provider, nothing to do (pure local mode).
+    if (!this.yjsProvider) {
+      return;
+    }
+
+    // Don’t sync mid-stroke — we’ll sync on pointerUp instead.
+    if (this._localPointerDown) {
+      console.debug("[collab] syncElements skipped during pointerDown");
+      return;
+    }
+
+    this._writeFullSceneToYjsSafe();
+
+    // keep Firebase persistence as before
     try {
       this.queueSaveToFirebase();
-    } catch (_) {}
-  };
-
-  queueBroadcastAllElements = throttle(() => {
-    // If using Yjs, avoid redundant periodic full-scene writes (Yjs persistence handles it)
-    if (this.yjsProvider) {
-      return;
+    } catch {
+      // ignore
     }
-
-    // fallback to portal-based broadcast
-    this.portal.broadcastScene(
-      WS_SUBTYPES.UPDATE,
-      this.excalidrawAPI.getSceneElementsIncludingDeleted(),
-      true,
-    );
-    const currentVersion = this.getLastBroadcastedOrReceivedSceneVersion();
-    const newVersion = Math.max(
-      currentVersion,
-      getSceneVersion(this.getSceneElementsIncludingDeleted()),
-    );
-    this.setLastBroadcastedOrReceivedSceneVersion(newVersion);
-  }, SYNC_FULL_SCENE_INTERVAL_MS);
+  };
 
   queueSaveToFirebase = throttle(
     () => {
@@ -1250,6 +1116,8 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     SYNC_FULL_SCENE_INTERVAL_MS,
     { leading: false },
   );
+
+  // ===== Username / room link / errors =====
 
   setUsername = (username: string) => {
     this.setState({ username });
@@ -1313,5 +1181,4 @@ if (isTestEnv() || isDevEnv()) {
 }
 
 export default Collab;
-
 export type TCollabClass = Collab;

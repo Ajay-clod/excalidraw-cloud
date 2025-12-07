@@ -1088,12 +1088,24 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     }
 
     // Don’t sync mid-stroke — we’ll sync on pointerUp instead.
-    if (this._localPointerDown) {
-      console.debug("[collab] syncElements skipped during pointerDown");
-      return;
-    }
+    // Determine if the user is *drawing a stroke* right now
+    const isDrawingStroke =
+      this._localPointerDown &&
+      elements.some(el =>
+        el.type === "freedraw" ||
+        el.type === "line" ||
+        el.type === "arrow"
+      );
 
-    this._writeFullSceneToYjsSafe();
+  // Only skip mid-stroke for stroke types
+  if (isDrawingStroke) {
+    // Don't commit incomplete strokes
+    return;
+  }
+
+// For shapes + text + arrows after pointerUp → always commit
+this._writeFullSceneToYjsSafe();
+
 
     // keep Firebase persistence as before
     try {
@@ -1102,6 +1114,23 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       // ignore
     }
   };
+
+
+    // ===== Batching for sync =====
+
+  private _queueForSync: OrderedExcalidrawElement[] | null = null;
+
+  queueSceneForSync(elements: readonly OrderedExcalidrawElement[]) {
+    this._queueForSync = elements as OrderedExcalidrawElement[];
+  }
+
+  flushQueuedSync() {
+    if (!this._queueForSync) return;
+    this.syncElements(this._queueForSync);
+    this._queueForSync = null;
+  }
+
+  
 
   queueSaveToFirebase = throttle(
     () => {

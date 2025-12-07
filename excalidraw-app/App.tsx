@@ -624,56 +624,47 @@ const ExcalidrawWrapper = () => {
   }, [excalidrawAPI]);
 
   const onChange = (
-    elements: readonly OrderedExcalidrawElement[],
-    appState: AppState,
-    files: BinaryFiles,
-  ) => {
-    if (collabAPI?.isCollaborating()) {
-      collabAPI.syncElements(elements);
-    }
+  elements: readonly OrderedExcalidrawElement[],
+  appState: AppState,
+  files: BinaryFiles,
+) => {
 
-    // this check is redundant, but since this is a hot path, it's best
-    // not to evaludate the nested expression every time
-    if (!LocalData.isSavePaused()) {
-      LocalData.save(elements, appState, files, () => {
-        if (excalidrawAPI) {
-          let didChange = false;
+  if (!LocalData.isSavePaused()) {
+    LocalData.save(elements, appState, files, () => {
+      if (excalidrawAPI) {
+        let didChange = false;
 
-          const elements = excalidrawAPI
-            .getSceneElementsIncludingDeleted()
-            .map((element) => {
-              if (
-                LocalData.fileStorage.shouldUpdateImageElementStatus(element)
-              ) {
-                const newElement = newElementWith(element, { status: "saved" });
-                if (newElement !== element) {
-                  didChange = true;
-                }
-                return newElement;
-              }
-              return element;
-            });
+        const updated = excalidrawAPI
+          .getSceneElementsIncludingDeleted()
+          .map((element) => {
+            if (LocalData.fileStorage.shouldUpdateImageElementStatus(element)) {
+              const newElement = newElementWith(element, { status: "saved" });
+              if (newElement !== element) didChange = true;
+              return newElement;
+            }
+            return element;
+          });
 
-          if (didChange) {
-            excalidrawAPI.updateScene({
-              elements,
-              captureUpdate: CaptureUpdateAction.NEVER,
-            });
-          }
+        if (didChange) {
+          excalidrawAPI.updateScene({
+            elements: updated,
+            captureUpdate: CaptureUpdateAction.NEVER,
+          });
         }
-      });
-    }
+      }
+    });
+  }
 
-    // Render the debug scene if the debug canvas is available
-    if (debugCanvasRef.current && excalidrawAPI) {
-      debugRenderer(
-        debugCanvasRef.current,
-        appState,
-        elements,
-        window.devicePixelRatio,
-      );
-    }
-  };
+  if (debugCanvasRef.current && excalidrawAPI) {
+    debugRenderer(
+      debugCanvasRef.current,
+      appState,
+      elements,
+      window.devicePixelRatio,
+    );
+  }
+};
+
 
   const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
     null,

@@ -159,6 +159,12 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   };
   private _initialScenePromiseResolved: boolean = false;
 
+  // Throttled writer (to avoid storms)
+  private _writeFullSceneThrottled: (() => void) & {
+    cancel?: () => void;
+    flush?: () => void;
+  };
+
   constructor(props: CollabProps) {
     super(props);
     this.state = {
@@ -221,6 +227,16 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     this.excalidrawAPI = props.excalidrawAPI;
     this.activeIntervalId = null;
     this.idleTimeoutId = null;
+
+    // Throttle writes to 800ms to avoid races and provider batching effects.
+    this._writeFullSceneThrottled = throttle(
+      () => {
+        // call sync write (sync because YjsProvider.writeElements is sync)
+        this._writeFullSceneToYjsSafe();
+      },
+      800,
+      { leading: true, trailing: true },
+    );
   }
 
   private onUmmount: (() => void) | null = null;
@@ -268,8 +284,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       this._pointerDownWatchdogId = undefined;
     }
 
-    // after finishing a stroke, we can safely sync the full scene to Yjs
-    this._writeFullSceneToYjsSafe();
+    // Use throttled writer to avoid write storms; we want a near-immediate flush but
+    // not synchronous blocking of UI.
+    this._writeFullSceneThrottled();
   };
 
   private _onPointerCancelBound = () => {
@@ -287,7 +304,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       this._pointerDownWatchdogId = undefined;
     }
 
-    this._writeFullSceneToYjsSafe();
+    this._writeFullSceneThrottled();
   };
 
   private _onWindowBlurBound = () => {
@@ -317,11 +334,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     });
     window.addEventListener("blur", this._onWindowBlurBound);
 
-    const unsubOnUserFollow = this.excalidrawAPI.onUserFollow(() => {
-      // In pure-Yjs mode, following can be implemented via awareness if desired.
-      // For now we no-op here.
-    });
-
+    const unsubOnUserFollow = this.excalidrawAPI.onUserFollow(() => {});
     const throttledRelayUserViewportBounds = throttleRAF(
       this.relayVisibleSceneBounds,
     );
@@ -373,10 +386,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     window.removeEventListener(EVENT.BEFORE_UNLOAD, this.beforeUnload);
     window.removeEventListener(EVENT.UNLOAD, this.onUnload);
     window.removeEventListener(EVENT.POINTER_MOVE, this.onPointerMove);
-    window.removeEventListener(
-      EVENT.VISIBILITY_CHANGE,
-      this.onVisibilityChange,
-    );
+    window.removeEventListener(EVENT.VISIBILITY_CHANGE, this.onVisibilityChange);
 
     // pointer handlers
     window.removeEventListener("pointerdown", this._onPointerDownBound);
@@ -399,6 +409,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       this.idleTimeoutId = null;
     }
     this.onUmmount?.();
+
+    // cancel throttled writes
+    this._writeFullSceneThrottled.cancel && this._writeFullSceneThrottled.cancel();
   }
 
   isCollaborating = () => appJotaiStore.get(isCollaboratingAtom)!;
@@ -744,12 +757,17 @@ class Collab extends PureComponent<CollabProps, CollabState> {
         ts: Date.now(),
       });
 
-      if (this._localPointerDown) {
-        // Don’t override the scene while the user is drawing;
-        // queue the last remote snapshot instead.
+      // Ignore empty snapshots (defensive)
+      if (!elements || elements.length === 0) {
+        console.warn("[collab] Ignoring empty Yjs update");
+        return;
+      }
+
+      // If user is actively drawing or editing text, queue remote snapshot
+      if (this._localPointerDown || this.isTextEditing()) {
         this._pendingRemoteElements = elements;
         console.debug(
-          "[collab] queued remote elements while pointer is down:",
+          "[collab] queued remote elements while local interaction active:",
           elements?.length ?? 0,
         );
         return;
@@ -762,27 +780,34 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   };
 
   private _applyYjsElements = (elements: readonly any[]) => {
-    if (!elements) return;
+    if (!elements || elements.length === 0) return;
 
     if (this._applyingRemote) {
       this._pendingRemoteElements = elements;
       return;
     }
 
-    if (this._localPointerDown) {
+    if (this._localPointerDown || this.isTextEditing()) {
       this._pendingRemoteElements = elements;
       return;
     }
 
     this._applyingRemote = true;
     try {
-      const restored = restoreElements(elements as any, null);
+      // restore remote elements to Excalidraw shape
+      let restoredRemote = restoreElements(elements as any, null) as ExcalidrawElement[];
+
+      // merge remote into local scene (preserve local edits, especially text editing)
+      const merged = this.mergeRemoteIntoLocal(restoredRemote);
+
+      // ensure fresh identities (shallow clones) for safe re-rendering
+      const withFreshIds = merged.map((el: any) => ({ ...el }));
 
       // Resolve initial scene promise exactly once
       if (this._initialScenePromise && !this._initialScenePromiseResolved) {
         this._initialScenePromiseResolved = true;
         this._initialScenePromise.resolve({
-          elements: restored,
+          elements: withFreshIds,
           scrollToContent: true,
         });
 
@@ -793,7 +818,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       }
 
       this.excalidrawAPI.updateScene({
-        elements: restored,
+        elements: withFreshIds,
         captureUpdate: CaptureUpdateAction.NEVER,
       });
 
@@ -932,10 +957,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
   private initializeIdleDetector = () => {
     document.addEventListener(EVENT.POINTER_MOVE, this.onPointerMove);
-    document.addEventListener(
-      EVENT.VISIBILITY_CHANGE,
-      this.onVisibilityChange,
-    );
+    document.addEventListener(EVENT.VISIBILITY_CHANGE, this.onVisibilityChange);
   };
 
   setCollaborators(sockets: SocketId[]) {
@@ -1053,18 +1075,25 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   private _writeFullSceneToYjsSafe = () => {
     if (!this.yjsProvider) return;
 
-    // Never write while mid-stroke
-    if (this._localPointerDown) {
+    // Never write while drawing or while editing text (avoid wiping local editing state)
+    if (this._localPointerDown || this.isTextEditing()) {
       return;
     }
 
     try {
-      const fullScene =
-        this.excalidrawAPI.getSceneElementsIncludingDeleted();
-      (this.yjsProvider as any).writeElements(fullScene as any);
-      console.debug("[collab] full scene written to Yjs", {
-        count: fullScene.length,
-      });
+      const fullScene = this.excalidrawAPI.getSceneElementsIncludingDeleted();
+
+      // IMPORTANT: your YjsProvider.writeElements is synchronous (mutates Y.Doc inside transact).
+      // Call it synchronously to avoid awaiting a non-promise and making things worse.
+      try {
+        (this.yjsProvider as any).writeElements(fullScene as any);
+        console.debug("[collab] full scene written to Yjs", {
+          count: fullScene.length,
+          ts: Date.now(),
+        });
+      } catch (innerErr) {
+        console.error("[collab] error calling yjsProvider.writeElements", innerErr);
+      }
     } catch (e) {
       console.error("[collab] writeElements to Yjs failed", e);
     }
@@ -1092,9 +1121,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     const isDrawingStroke =
       this._localPointerDown &&
       elements.some(el =>
-        el.type === "freedraw" ||
-        el.type === "line" ||
-        el.type === "arrow"
+        el.type === "freedraw" || el.type === "line" || el.type === "arrow",
       );
 
   // Only skip mid-stroke for stroke types
@@ -1104,8 +1131,16 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   }
 
 // For shapes + text + arrows after pointerUp → always commit
-this._writeFullSceneToYjsSafe();
+    const containsText = elements.some(el => el.type === "text");
 
+    // Use throttled writer for both text and non-text, so writes are rate-limited.
+    // For text we call flush to ensure someone typing will be sent reasonably quickly.
+    if (containsText) {
+      // flushing throttled function will schedule/emit appropriately
+      this._writeFullSceneThrottled();
+    } else {
+      this._writeFullSceneThrottled();
+    }
 
     // keep Firebase persistence as before
     try {
@@ -1115,8 +1150,7 @@ this._writeFullSceneToYjsSafe();
     }
   };
 
-
-    // ===== Batching for sync =====
+  // ===== Batching for sync =====
 
   private _queueForSync: OrderedExcalidrawElement[] | null = null;
 
@@ -1129,8 +1163,6 @@ this._writeFullSceneToYjsSafe();
     this.syncElements(this._queueForSync);
     this._queueForSync = null;
   }
-
-  
 
   queueSaveToFirebase = throttle(
     () => {
@@ -1145,6 +1177,62 @@ this._writeFullSceneToYjsSafe();
     SYNC_FULL_SCENE_INTERVAL_MS,
     { leading: false },
   );
+
+  // ===== Merge utility (remote -> local) =====
+
+  /**
+   * Merge remote snapshot into local scene:
+   * - keep local element if user is currently editing that element
+   * - otherwise pick element with higher `updated` timestamp (remote wins if newer)
+   * - preserve remote ordering; append local-only items at the end
+   */
+  private mergeRemoteIntoLocal(remote: ExcalidrawElement[]): ExcalidrawElement[] {
+    const local = this.excalidrawAPI.getSceneElementsIncludingDeleted();
+    const localById = new Map<string, ExcalidrawElement>();
+    for (const le of local) {
+      localById.set(le.id, le);
+    }
+
+    const editingElement = this.excalidrawAPI.getAppState().editingTextElement;
+    const editingId = editingElement ? editingElement.id : null;
+
+    const merged: ExcalidrawElement[] = [];
+
+    // Build set of remote ids to preserve order
+    const remoteIds = new Set<string>();
+    for (const re of remote) {
+      remoteIds.add(re.id);
+      const localEl = localById.get(re.id);
+      if (localEl) {
+        // If user is editing this element locally, keep local version
+        if (editingId && editingId === re.id) {
+          merged.push(localEl);
+        } else {
+          // Use updated timestamp if present, otherwise fallback to remote
+          const localUpdated = (localEl as any).updated ?? 0;
+          const remoteUpdated = (re as any).updated ?? 0;
+          if (remoteUpdated >= localUpdated) {
+            merged.push(re);
+          } else {
+            merged.push(localEl);
+          }
+        }
+        // remove from localById processed
+        localById.delete(re.id);
+      } else {
+        // remote-only element: add it
+        merged.push(re);
+      }
+    }
+
+    // Append any remaining local-only elements that didn't exist in remote
+    for (const [id, leftoverLocal] of localById.entries()) {
+      // keep the local element as-is
+      merged.push(leftoverLocal);
+    }
+
+    return merged;
+  }
 
   // ===== Username / room link / errors =====
 
@@ -1196,6 +1284,17 @@ this._writeFullSceneToYjsSafe();
         )}
       </>
     );
+  }
+
+  // ===== helpers =====
+
+  private isTextEditing(): boolean {
+    try {
+      const appState = this.excalidrawAPI.getAppState();
+      return !!appState?.editingTextElement; // true if user is currently editing text
+    } catch {
+      return false;
+    }
   }
 }
 

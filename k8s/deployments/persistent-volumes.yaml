@@ -1,0 +1,39 @@
+# Persistent Volume Claim for Redis or other stateful services
+# This uses Google Compute Engine Persistent Disk (GCE PD)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  labels:
+    app: excalidraw
+    component: redis
+spec:
+  accessModes:
+    # ReadWriteOnce: Can be mounted as read-write by a single node
+    # Use ReadWriteMany if you need multi-node access (requires Filestore)
+    - ReadWriteOnce
+  # Storage class options for GKE:
+  # - standard-rwo: Standard persistent disk (HDD) - balanced cost/performance
+  # - premium-rwo: SSD persistent disk - better performance, higher cost
+  # - balanced-rwo: Balanced SSD persistent disk
+  storageClassName: standard-rwo
+  resources:
+    requests:
+      # TODO: Adjust size based on your Redis data requirements
+      storage: 10Gi
+---
+# Example: Additional PVC for application data (if needed)
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: excalidraw-app-data
+#   labels:
+#     app: excalidraw
+# spec:
+#   accessModes:
+#     - ReadWriteOnce
+#   storageClassName: standard-rwo
+#   resources:
+#     requests:
+#       storage: 5Gi

@@ -3,16 +3,38 @@ kind: Ingress
 metadata:
   name: excalidraw-ingress
   annotations:
+    # For NGINX Ingress Controller (recommended)
     nginx.ingress.kubernetes.io/websocket-services: "excalidraw-yjs"
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # For GCP HTTP(S) Load Balancer (alternative)
+    # Uncomment the following and comment out nginx annotations above
+    # kubernetes.io/ingress.class: "gce"
+    # kubernetes.io/ingress.global-static-ip-name: "excalidraw-ip"
+    # networking.gke.io/managed-certificates: "excalidraw-cert"
+    
+    # For cert-manager with Let's Encrypt
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
 spec:
+  # Ingress class - choose one:
+  # - nginx: For NGINX Ingress Controller
+  # - gce: For GCP HTTP(S) Load Balancer
   ingressClassName: nginx
+  
   tls:
     - hosts:
+        # TODO: Update with your actual domain names
         - your-domain.com
         - yjs.your-domain.com
+      # Secret name for TLS certificate
+      # - For cert-manager: Auto-generated based on hosts
+      # - For manual certs: Create secret with kubectl create secret tls
+      # - For GCP managed certs: Use ManagedCertificate resource instead
       secretName: tls-secret
+  
   rules:
+    # Frontend application
     - host: your-domain.com
       http:
         paths:
@@ -23,7 +45,8 @@ spec:
                 name: excalidraw-frontend
                 port:
                   number: 80
-
+    
+    # YJS WebSocket server for collaboration
     - host: yjs.your-domain.com
       http:
         paths:
@@ -34,3 +57,14 @@ spec:
                 name: excalidraw-yjs
                 port:
                   number: 1234
+---
+# Optional: Google-managed certificate (only if using GCE ingress)
+# Uncomment and apply separately if using GCP HTTP(S) Load Balancer
+# apiVersion: networking.gke.io/v1
+# kind: ManagedCertificate
+# metadata:
+#   name: excalidraw-cert
+# spec:
+#   domains:
+#     - your-domain.com
+#     - yjs.your-domain.com

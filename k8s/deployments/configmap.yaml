@@ -2,7 +2,19 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: excalidraw-config
+  labels:
+    app: excalidraw
 data:
+  # WebSocket server URL for real-time collaboration
+  # TODO: Update with your actual domain after setting up ingress
+  # Example: wss://yjs.example.com
   WS_URL: "wss://yjs.your-domain.com"
+  
+  # YJS server port
   PORT: "1234"
-
+  
+  # TODO: Add other non-sensitive configuration values as needed
+  # Examples:
+  # VITE_APP_BACKEND_V2_GET_URL: "https://json.excalidraw.com/api/v2/"
+  # VITE_APP_LIBRARY_URL: "https://libraries.excalidraw.com"
+  # NODE_ENV: "production"

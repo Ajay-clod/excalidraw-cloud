@@ -6,6 +6,8 @@ COPY . .
 
 # do not ignore optional dependencies:
 # Error: Cannot find module @rollup/rollup-linux-x64-gnu
+# Note: strict-ssl is disabled to handle self-signed certificates in build environments
+# This only affects the build process, not the runtime application
 RUN --mount=type=cache,target=/root/.cache/yarn \
     yarn config set strict-ssl false && \
     npm_config_target_arch=${TARGETARCH} yarn --network-timeout 600000 --ignore-engines

@@ -12,6 +12,7 @@
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { IndexeddbPersistence } from "y-indexeddb";
+
 import type { ExcalidrawElement } from "@excalidraw/element/types";
 
 export type YjsProviderOpts = {
@@ -59,7 +60,10 @@ export default class YjsProvider {
 
     if (opts.persist) {
       try {
-        this.indexeddb = new IndexeddbPersistence(`excalidraw-${roomId}`, this.doc);
+        this.indexeddb = new IndexeddbPersistence(
+          `excalidraw-${roomId}`,
+          this.doc,
+        );
         await this.indexeddb.whenSynced;
         // eslint-disable-next-line no-console
         console.info("[yjsprovider] indexeddb persistence synced", { roomId });
@@ -69,7 +73,9 @@ export default class YjsProvider {
       }
     }
 
-    this.provider = new WebsocketProvider(wsUrl, roomId, this.doc, { connect: true });
+    this.provider = new WebsocketProvider(wsUrl, roomId, this.doc, {
+      connect: true,
+    });
 
     try {
       (this.provider as any).on("status", (event: any) => {
@@ -148,7 +154,9 @@ export default class YjsProvider {
     if (order.length > 0) {
       for (const id of order) {
         const ym = this.elementsMap.get(id) as Y.Map<any> | undefined;
-        if (ym) out.push(this.yMapToElement(id, ym));
+        if (ym) {
+          out.push(this.yMapToElement(id, ym));
+        }
       }
     } else {
       this.elementsMap.forEach((ym: Y.Map<any>, id: string) => {
@@ -188,7 +196,9 @@ export default class YjsProvider {
 
   // Append incremental points for a given element (efficient small ops).
   writePoints(elementId: string, pointsBatch: any[]) {
-    if (!pointsBatch || pointsBatch.length === 0) return;
+    if (!pointsBatch || pointsBatch.length === 0) {
+      return;
+    }
     // eslint-disable-next-line no-console
     console.debug("[yjsprovider] writePoints", {
       id: elementId,
@@ -279,11 +289,11 @@ export default class YjsProvider {
           if (typeof v === "string" && v.length > 0) {
             ytext.insert(0, v);
           }
-        } else {
+        } else if (typeof v === "string") {
           // replace content with the string value for final commits
-          if (typeof v === "string") {
-            ytext.delete(0, ytext.length);
-            if (v.length > 0) ytext.insert(0, v);
+          ytext.delete(0, ytext.length);
+          if (v.length > 0) {
+            ytext.insert(0, v);
           }
         }
       } else {
@@ -317,6 +327,7 @@ export default class YjsProvider {
     if (this.onElementsCb) {
       try {
         const elements = this.readAllElements();
+        // eslint-disable-next-line no-console
         console.debug("[yjs] _onYChange -> readAllElements", {
           len: elements?.length ?? 0,
           ts: Date.now(),
@@ -331,7 +342,9 @@ export default class YjsProvider {
   };
 
   private _onAwarenessChange = () => {
-    if (!this.provider) return;
+    if (!this.provider) {
+      return;
+    }
     const awareness = (this.provider as any).awareness;
     const states = new Map<number, any>(
       Array.from(awareness.getStates().entries()),

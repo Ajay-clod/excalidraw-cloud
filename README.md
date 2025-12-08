@@ -100,6 +100,18 @@ yarn add react react-dom @excalidraw/excalidraw
 
 Check out our [documentation](https://docs.excalidraw.com/docs/@excalidraw/excalidraw/installation) for more details!
 
+## Deployment
+
+### Cloud Deployment
+
+Excalidraw can be deployed to various cloud platforms:
+
+- **Google Cloud Platform**: See our comprehensive [GCP deployment guide](docs/gcp-deploy.md) for step-by-step instructions on deploying to Google Kubernetes Engine (GKE).
+- **Kubernetes**: Production-ready Kubernetes manifests are available in the [`k8s/`](k8s/) directory. See the [k8s README](k8s/README.md) for details.
+- **Docker**: Use the included `Dockerfile` and `docker-compose.yml` for containerized deployments.
+
+For production deployments, we recommend using Kubernetes on GCP (GKE), AWS (EKS), or Azure (AKS) for scalability and high availability.
+
 ## Contributing
 
 - Missing something or found a bug? [Report here](https://github.com/excalidraw/excalidraw/issues).

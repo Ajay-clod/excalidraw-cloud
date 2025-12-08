@@ -2,6 +2,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: excalidraw-yjs
+  labels:
+    app: excalidraw-yjs
+    version: v1
 spec:
   replicas: 3
   selector:
@@ -11,14 +14,72 @@ spec:
     metadata:
       labels:
         app: excalidraw-yjs
+        version: v1
     spec:
+      # Use dedicated service account for Workload Identity
+      # serviceAccountName: excalidraw-ksa
       containers:
         - name: yjs
+          # TODO: Update image with your Google Artifact Registry URL
+          # Format: REGION-docker.pkg.dev/PROJECT_ID/excalidraw-repo/excalidraw-yjs:TAG
+          # Example: us-central1-docker.pkg.dev/my-project/excalidraw-repo/excalidraw-yjs:latest
           image: your-dockerhub/excalidraw-yjs:latest
+          imagePullPolicy: Always
           ports:
-            - containerPort: 1234
+            - name: websocket
+              containerPort: 1234
+              protocol: TCP
           env:
             - name: PORT
               value: "1234"
+            # TODO: Update with your Redis URL or use Secret Manager
+            # Option 1: Direct value (not recommended for production)
+            # - name: REDIS_URL
+            #   value: "redis://<YOUR_REDIS_MASTER_URL>:6379"
+            # Option 2: Load from Kubernetes Secret
+            # - name: REDIS_URL
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: excalidraw-app-secrets
+            #       key: redis-url
+            # Option 3: Use Google Memorystore (managed Redis)
+            # Follow: https://cloud.google.com/memorystore/docs/redis/connect-redis-instance-gke
             - name: REDIS_URL
               value: "redis://<YOUR_REDIS_MASTER_URL>:6379"
+          # Resource requests and limits (adjust based on load testing)
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          # Liveness probe for WebSocket service
+          livenessProbe:
+            tcpSocket:
+              port: websocket
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Readiness probe for WebSocket service
+          readinessProbe:
+            tcpSocket:
+              port: websocket
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+      # Improve pod distribution for high availability
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - excalidraw-yjs
+                topologyKey: kubernetes.io/hostname

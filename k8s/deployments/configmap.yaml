@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: excalidraw-config
+data:
+  WS_URL: "wss://yjs.your-domain.com"
+  PORT: "1234"
+

@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: excalidraw-yjs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: excalidraw-yjs
+  template:
+    metadata:
+      labels:
+        app: excalidraw-yjs
+    spec:
+      containers:
+        - name: yjs
+          image: your-dockerhub/excalidraw-yjs:latest
+          ports:
+            - containerPort: 1234
+          env:
+            - name: PORT
+              value: "1234"
+            - name: REDIS_URL
+              value: "redis://<YOUR_REDIS_MASTER_URL>:6379"

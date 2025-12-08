@@ -15,6 +15,7 @@
 //  REDIS_URL=redis://redis:6379 node index.js
 
 const http = require("http");
+
 const express = require("express");
 const WebSocket = require("ws");
 const { setupWSConnection, getYDoc } = require("y-websocket/bin/utils");
@@ -41,14 +42,19 @@ if (REDIS_URL) {
 
   // Use pattern subscribe to catch all rooms: channel format `yjs:<room>`
   sub.psubscribe("yjs:*").then(() => {
+    // eslint-disable-next-line no-console
     console.log("Subscribed to Redis pattern yjs:*");
   });
 
   sub.on("pmessage", async (_pattern, channel, message) => {
     try {
-      if (!channel.startsWith("yjs:")) return;
+      if (!channel.startsWith("yjs:")) {
+        return;
+      }
       const room = channel.slice(4);
-      if (!room) return;
+      if (!room) {
+        return;
+      }
 
       // message is base64 encoded update bytes
       const update = Buffer.from(message, "base64");
@@ -67,7 +73,9 @@ if (REDIS_URL) {
   pub.on("error", (e) => console.error("redis pub error", e));
   sub.on("error", (e) => console.error("redis sub error", e));
 } else {
-  console.warn("REDIS_URL not set — running single-instance without cross-instance bridging");
+  console.warn(
+    "REDIS_URL not set — running single-instance without cross-instance bridging",
+  );
 }
 
 // Keep track of which docs we have attached publish handlers to (avoid duplicate handlers)
@@ -89,14 +97,18 @@ wss.on("connection", (conn, req) => {
 
   // Determine room name from request URL like the protocol expects
   const getRoomFromReqUrl = (reqUrl) => {
-    if (!reqUrl) return null;
+    if (!reqUrl) {
+      return null;
+    }
     // strip query string and leading slash
     const path = reqUrl.split("?")[0];
     return path.startsWith("/") ? path.slice(1) : path;
   };
 
   const room = getRoomFromReqUrl(req.url);
-  if (!room) return; // nothing we can do
+  if (!room) {
+    return;
+  } // nothing we can do
 
   // Attach publish handler once per room (idempotent)
   if (redisEnabled && !docsWithPublishHandler.has(room)) {
@@ -106,7 +118,9 @@ wss.on("connection", (conn, req) => {
       // doc.on('update', (update, origin) => {}) captures the raw Yjs update bytes
       const updateHandler = (update, origin) => {
         // Skip updates that came from Redis to avoid republishing loops
-        if (origin === "redis") return;
+        if (origin === "redis") {
+          return;
+        }
 
         try {
           if (pub) {
@@ -131,8 +145,10 @@ wss.on("connection", (conn, req) => {
 
 // Start server
 server.listen(PORT, () => {
+  // eslint-disable-next-line no-console
   console.log(`y-websocket server listening on http://0.0.0.0:${PORT}`);
   if (redisEnabled) {
+    // eslint-disable-next-line no-console
     console.log("Redis bridging enabled:", REDIS_URL);
   }
 });

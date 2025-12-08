@@ -87,10 +87,14 @@ import { resetBrowserStateVersions } from "../data/tabSync";
 import { collabErrorIndicatorAtom } from "./CollabError";
 import Portal from "./Portal";
 
-import type { SocketUpdateDataSource, SyncableExcalidrawElement } from "../data";
+import YjsProvider from "./YjsProvider";
+
+import type {
+  SocketUpdateDataSource,
+  SyncableExcalidrawElement,
+} from "../data";
 
 /* === YjsProvider import === */
-import YjsProvider from "./YjsProvider";
 
 export const collabAPIAtom = atom<CollabAPI | null>(null);
 export const isCollaboratingAtom = atom(false);
@@ -386,7 +390,10 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     window.removeEventListener(EVENT.BEFORE_UNLOAD, this.beforeUnload);
     window.removeEventListener(EVENT.UNLOAD, this.onUnload);
     window.removeEventListener(EVENT.POINTER_MOVE, this.onPointerMove);
-    window.removeEventListener(EVENT.VISIBILITY_CHANGE, this.onVisibilityChange);
+    window.removeEventListener(
+      EVENT.VISIBILITY_CHANGE,
+      this.onVisibilityChange,
+    );
 
     // pointer handlers
     window.removeEventListener("pointerdown", this._onPointerDownBound);
@@ -411,7 +418,8 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     this.onUmmount?.();
 
     // cancel throttled writes
-    this._writeFullSceneThrottled.cancel && this._writeFullSceneThrottled.cancel();
+    this._writeFullSceneThrottled.cancel &&
+      this._writeFullSceneThrottled.cancel();
   }
 
   isCollaborating = () => appJotaiStore.get(isCollaboratingAtom)!;
@@ -517,15 +525,14 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
       LocalData.fileStorage.reset();
 
-      const elements =
-        this.excalidrawAPI.getSceneElementsIncludingDeleted().map(
-          (element) => {
-            if (isImageElement(element) && element.status === "saved") {
-              return newElementWith(element, { status: "pending" });
-            }
-            return element;
-          },
-        );
+      const elements = this.excalidrawAPI
+        .getSceneElementsIncludingDeleted()
+        .map((element) => {
+          if (isImageElement(element) && element.status === "saved") {
+            return newElementWith(element, { status: "pending" });
+          }
+          return element;
+        });
 
       this.excalidrawAPI.updateScene({
         elements,
@@ -647,7 +654,12 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
     const wsServerUrl =
       normalizedEnvYjs || normalizedEnvWsServer || "ws://localhost:1234";
-    console.info("[collab] resolved wsServerUrl:", wsServerUrl, "room:", roomId);
+    console.info(
+      "[collab] resolved wsServerUrl:",
+      wsServerUrl,
+      "room:",
+      roomId,
+    );
 
     // Set portal room data for Firebase, but we won't use portal sockets.
     this.portal.roomId = roomId;
@@ -656,12 +668,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
     try {
       const wsUrlForYjs = wsServerUrl;
-      console.info(
-        "[collab] Yjs websocket URL:",
-        wsUrlForYjs,
-        "room:",
-        roomId,
-      );
+      console.info("[collab] Yjs websocket URL:", wsUrlForYjs, "room:", roomId);
 
       this.yjsProvider = new YjsProvider();
       await this.yjsProvider.init(roomId, wsUrlForYjs, {
@@ -751,6 +758,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
   private _onYjsElementsChanged = (elements: any[]) => {
     try {
+      // eslint-disable-next-line no-console
       console.debug("[collab] onElementsChanged received", {
         len: elements?.length ?? 0,
         localPointerDown: this._localPointerDown,
@@ -766,6 +774,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       // If user is actively drawing or editing text, queue remote snapshot
       if (this._localPointerDown || this.isTextEditing()) {
         this._pendingRemoteElements = elements;
+        // eslint-disable-next-line no-console
         console.debug(
           "[collab] queued remote elements while local interaction active:",
           elements?.length ?? 0,
@@ -780,7 +789,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   };
 
   private _applyYjsElements = (elements: readonly any[]) => {
-    if (!elements || elements.length === 0) return;
+    if (!elements || elements.length === 0) {
+      return;
+    }
 
     if (this._applyingRemote) {
       this._pendingRemoteElements = elements;
@@ -795,7 +806,10 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     this._applyingRemote = true;
     try {
       // restore remote elements to Excalidraw shape
-      let restoredRemote = restoreElements(elements as any, null) as ExcalidrawElement[];
+      const restoredRemote = restoreElements(
+        elements as any,
+        null,
+      ) as ExcalidrawElement[];
 
       // merge remote into local scene (preserve local edits, especially text editing)
       const merged = this.mergeRemoteIntoLocal(restoredRemote);
@@ -848,9 +862,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
 
       try {
         localClientId =
-          (provider &&
-            provider.awareness &&
-            provider.awareness.clientID) ??
+          (provider && provider.awareness && provider.awareness.clientID) ??
           (this.yjsProvider as any).doc?.clientID ??
           null;
       } catch {
@@ -975,10 +987,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     this.excalidrawAPI.updateScene({ collaborators });
   }
 
-  updateCollaborator = (
-    socketId: SocketId,
-    updates: Partial<Collaborator>,
-  ) => {
+  updateCollaborator = (socketId: SocketId, updates: Partial<Collaborator>) => {
     const collaborators = new Map(this.collaborators);
     const user: Mutable<Collaborator> = Object.assign(
       {},
@@ -1040,7 +1049,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     try {
       const status = this.yjsProvider?.getStatus();
       const provider = status?.provider as any;
-      if (!provider?.awareness?.setLocalState) return;
+      if (!provider?.awareness?.setLocalState) {
+        return;
+      }
 
       const prev = provider.awareness.getLocalState() || {};
       if (props?.force || appState.followedBy.size > 0) {
@@ -1058,7 +1069,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     try {
       const status = this.yjsProvider?.getStatus();
       const provider = status?.provider as any;
-      if (!provider?.awareness?.setLocalState) return;
+      if (!provider?.awareness?.setLocalState) {
+        return;
+      }
       const prev = provider.awareness.getLocalState() || {};
       provider.awareness.setLocalState({
         ...prev,
@@ -1073,7 +1086,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   // ===== Excalidraw → Yjs sync =====
 
   private _writeFullSceneToYjsSafe = () => {
-    if (!this.yjsProvider) return;
+    if (!this.yjsProvider) {
+      return;
+    }
 
     // Never write while drawing or while editing text (avoid wiping local editing state)
     if (this._localPointerDown || this.isTextEditing()) {
@@ -1087,12 +1102,16 @@ class Collab extends PureComponent<CollabProps, CollabState> {
       // Call it synchronously to avoid awaiting a non-promise and making things worse.
       try {
         (this.yjsProvider as any).writeElements(fullScene as any);
+        // eslint-disable-next-line no-console
         console.debug("[collab] full scene written to Yjs", {
           count: fullScene.length,
           ts: Date.now(),
         });
       } catch (innerErr) {
-        console.error("[collab] error calling yjsProvider.writeElements", innerErr);
+        console.error(
+          "[collab] error calling yjsProvider.writeElements",
+          innerErr,
+        );
       }
     } catch (e) {
       console.error("[collab] writeElements to Yjs failed", e);
@@ -1120,18 +1139,19 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     // Determine if the user is *drawing a stroke* right now
     const isDrawingStroke =
       this._localPointerDown &&
-      elements.some(el =>
-        el.type === "freedraw" || el.type === "line" || el.type === "arrow",
+      elements.some(
+        (el) =>
+          el.type === "freedraw" || el.type === "line" || el.type === "arrow",
       );
 
-  // Only skip mid-stroke for stroke types
-  if (isDrawingStroke) {
-    // Don't commit incomplete strokes
-    return;
-  }
+    // Only skip mid-stroke for stroke types
+    if (isDrawingStroke) {
+      // Don't commit incomplete strokes
+      return;
+    }
 
-// For shapes + text + arrows after pointerUp → always commit
-    const containsText = elements.some(el => el.type === "text");
+    // For shapes + text + arrows after pointerUp → always commit
+    const containsText = elements.some((el) => el.type === "text");
 
     // Use throttled writer for both text and non-text, so writes are rate-limited.
     // For text we call flush to ensure someone typing will be sent reasonably quickly.
@@ -1159,7 +1179,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
   }
 
   flushQueuedSync() {
-    if (!this._queueForSync) return;
+    if (!this._queueForSync) {
+      return;
+    }
     this.syncElements(this._queueForSync);
     this._queueForSync = null;
   }
@@ -1186,7 +1208,9 @@ class Collab extends PureComponent<CollabProps, CollabState> {
    * - otherwise pick element with higher `updated` timestamp (remote wins if newer)
    * - preserve remote ordering; append local-only items at the end
    */
-  private mergeRemoteIntoLocal(remote: ExcalidrawElement[]): ExcalidrawElement[] {
+  private mergeRemoteIntoLocal(
+    remote: ExcalidrawElement[],
+  ): ExcalidrawElement[] {
     const local = this.excalidrawAPI.getSceneElementsIncludingDeleted();
     const localById = new Map<string, ExcalidrawElement>();
     for (const le of local) {
@@ -1226,7 +1250,7 @@ class Collab extends PureComponent<CollabProps, CollabState> {
     }
 
     // Append any remaining local-only elements that didn't exist in remote
-    for (const [id, leftoverLocal] of localById.entries()) {
+    for (const [, leftoverLocal] of localById.entries()) {
       // keep the local element as-is
       merged.push(leftoverLocal);
     }

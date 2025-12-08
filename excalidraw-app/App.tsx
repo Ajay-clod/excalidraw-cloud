@@ -624,47 +624,49 @@ const ExcalidrawWrapper = () => {
   }, [excalidrawAPI]);
 
   const onChange = (
-  elements: readonly OrderedExcalidrawElement[],
-  appState: AppState,
-  files: BinaryFiles,
-) => {
+    elements: readonly OrderedExcalidrawElement[],
+    appState: AppState,
+    files: BinaryFiles,
+  ) => {
+    if (!LocalData.isSavePaused()) {
+      LocalData.save(elements, appState, files, () => {
+        if (excalidrawAPI) {
+          let didChange = false;
 
-  if (!LocalData.isSavePaused()) {
-    LocalData.save(elements, appState, files, () => {
-      if (excalidrawAPI) {
-        let didChange = false;
+          const updated = excalidrawAPI
+            .getSceneElementsIncludingDeleted()
+            .map((element) => {
+              if (
+                LocalData.fileStorage.shouldUpdateImageElementStatus(element)
+              ) {
+                const newElement = newElementWith(element, { status: "saved" });
+                if (newElement !== element) {
+                  didChange = true;
+                }
+                return newElement;
+              }
+              return element;
+            });
 
-        const updated = excalidrawAPI
-          .getSceneElementsIncludingDeleted()
-          .map((element) => {
-            if (LocalData.fileStorage.shouldUpdateImageElementStatus(element)) {
-              const newElement = newElementWith(element, { status: "saved" });
-              if (newElement !== element) didChange = true;
-              return newElement;
-            }
-            return element;
-          });
-
-        if (didChange) {
-          excalidrawAPI.updateScene({
-            elements: updated,
-            captureUpdate: CaptureUpdateAction.NEVER,
-          });
+          if (didChange) {
+            excalidrawAPI.updateScene({
+              elements: updated,
+              captureUpdate: CaptureUpdateAction.NEVER,
+            });
+          }
         }
-      }
-    });
-  }
+      });
+    }
 
-  if (debugCanvasRef.current && excalidrawAPI) {
-    debugRenderer(
-      debugCanvasRef.current,
-      appState,
-      elements,
-      window.devicePixelRatio,
-    );
-  }
-};
-
+    if (debugCanvasRef.current && excalidrawAPI) {
+      debugRenderer(
+        debugCanvasRef.current,
+        appState,
+        elements,
+        window.devicePixelRatio,
+      );
+    }
+  };
 
   const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
     null,

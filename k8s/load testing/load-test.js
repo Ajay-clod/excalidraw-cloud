@@ -7,14 +7,15 @@ function createClient(i) {
   const ws = new WebSocket(WS_URL);
 
   ws.on("open", () => {
+    // eslint-disable-next-line no-console
     console.log(`Client ${i} connected`);
 
     setInterval(() => {
       ws.send(
         JSON.stringify({
           type: "sync",
-          payload: { x: Math.random(), y: Math.random() }
-        })
+          payload: { x: Math.random(), y: Math.random() },
+        }),
       );
     }, 50);
   });
